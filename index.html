@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>3Dモデルビューア</title>
+<style>
+  :root {
+    --bar-bg: #0b3d66;
+    --bar-fg: #ffffff;
+    --muted: #b9cde0;
+    --error: #ffb4a8;
+    --btn-bg: rgba(255, 255, 255, 0.14);
+    --btn-border: rgba(255, 255, 255, 0.35);
+    --page-bg: #eef1f5;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--page-bg); }
+  body {
+    display: flex; flex-direction: column;
+    font-family: "Yu Gothic UI", "Hiragino Sans", "Meiryo", system-ui, sans-serif;
+  }
+  header {
+    flex: none; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 8px 16px; padding-top: max(8px, env(safe-area-inset-top));
+    background: var(--bar-bg); color: var(--bar-fg); font-size: 14px;
+  }
+  #status { flex: 1 1 200px; min-width: 0; line-height: 1.4; }
+  #status small { display: block; color: var(--muted); font-size: 12px; }
+  #status.error { color: var(--error); }
+  .spinner {
+    width: 14px; height: 14px; border-radius: 50%; flex: none;
+    border: 2px solid var(--btn-border); border-top-color: var(--bar-fg);
+    animation: spin 0.9s linear infinite;
+  }
+  .spinner[hidden] { display: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  header button, header a {
+    flex: none; font: inherit; font-size: 13px; color: var(--bar-fg); text-decoration: none;
+    background: var(--btn-bg); border: 1px solid var(--btn-border); border-radius: 4px;
+    padding: 6px 10px; cursor: pointer;
+  }
+  header button[hidden], header a[hidden] { display: none; }
+  iframe { flex: 1; width: 100%; border: 0; background: var(--page-bg); }
+  #debug {
+    flex: none; max-height: 40vh; overflow: auto; margin: 0; padding: 8px 16px;
+    background: #111; color: #cfe; font: 12px/1.4 Consolas, monospace; white-space: pre-wrap;
+  }
+  #debug[hidden] { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="spinner" id="spinner"></div>
+  <div id="status">準備しています…</div>
+  <button id="btnFocus" type="button" hidden>対象を表示</button>
+  <button id="btnAll" type="button" hidden>全体を表示</button>
+  <a id="lnkOpen" target="_blank" rel="noopener" hidden>Trimble Connect で開く</a>
+</header>
+<iframe id="viewer" title="Trimble Connect 3D ビューア" allow="fullscreen; xr-spatial-tracking"></iframe>
+<pre id="debug" hidden></pre>
+
+<script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js"></script>
+<script>
+/*
+ * QR コード用中継ページ
+ *
+ * パラメータ:
+ *   pid    Trimble Connect プロジェクト ID（必須）
+ *   mid    モデル（ファイル）ID（必須）
+ *   stoken 共有トークン（公開リンク）。無い場合は Trimble Connect のビューアへそのまま移動する
+ *   org    共有リンクの発行元ホスト（例: app21.connect.trimble.com）
+ *   apos   製品マーク（; 区切り、? は任意の 1 文字、* は任意の文字列）
+ *   ppos   部材マーク（同上）
+ *   iso=1  対象以外を非表示にする
+ *   ap/pp  照合するプロパティ名を明示する（既定は自動判定）
+ *   mode   api（既定）| url  埋め込み方式
+ *   debug=1 プロパティ名などの診断情報を表示
+ */
+(function () {
+  "use strict";
+
+  // パラメータは「#」以降（フラグメント）から読む。フラグメントはサーバーへ送信されないため、
+  // 共有トークンがホスティング側のアクセスログに残らない。旧形式の「?」以降にも対応する。
+  const q = new URLSearchParams(location.search);
+  new URLSearchParams(location.hash.replace(/^#/, "")).forEach((value, key) => q.set(key, value));
+  const pid = q.get("pid") || "";
+  const mid = q.get("mid") || "";
+  const stoken = q.get("stoken") || "";
+  const org = q.get("org") || "";
+  const apos = splitPatterns(q.get("apos"));
+  const ppos = splitPatterns(q.get("ppos"));
+  const isolate = q.get("iso") === "1";
+  const mode = q.get("mode") === "url" ? "url" : "api";
+  const debugOn = q.get("debug") === "1";
+  const apName = q.get("ap");
+  const ppName = q.get("pp");
+
+  const ASSEMBLY_PROPS = /^(assembly\/cast unit mark|assembly[ _]?(pos|position|mark)|cast ?unit ?(mark|pos)|製品(符号|番号))$/i;
+  const PART_PROPS = /^(part[ _]?(pos|position|mark)|preliminary mark|部材(符号|番号))$/i;
+
+  const el = {
+    status: document.getElementById("status"),
+    spinner: document.getElementById("spinner"),
+    frame: document.getElementById("viewer"),
+    focus: document.getElementById("btnFocus"),
+    all: document.getElementById("btnAll"),
+    open: document.getElementById("lnkOpen"),
+    debug: document.getElementById("debug"),
+  };
+
+  const viewerUrl = buildViewerUrl();
+  el.open.href = viewerUrl;
+
+  let api = null;
+  let matched = [];
+  const label = [apos.join(", "), ppos.join(", ")].filter(Boolean).join(" / ");
+
+  function splitPatterns(value) {
+    return (value || "").split(";").map(s => s.trim()).filter(Boolean);
+  }
+
+  function buildViewerUrl() {
+    let url = "https://web.connect.trimble.com/projects/" + encodeURIComponent(pid) +
+      "/viewer/3d/?modelId=" + encodeURIComponent(mid);
+    if (org) url += "&origin=" + encodeURIComponent(org);
+    if (stoken) url += "&stoken=" + encodeURIComponent(stoken);
+    return url;
+  }
+
+  function setStatus(text, sub, isError) {
+    el.status.className = isError ? "error" : "";
+    el.status.textContent = text;
+    if (sub) {
+      const s = document.createElement("small");
+      s.textContent = sub;
+      el.status.appendChild(s);
+    }
+  }
+
+  function busy(on) { el.spinner.hidden = !on; }
+
+  function log(...args) {
+    if (!debugOn) return;
+    el.debug.hidden = false;
+    el.debug.textContent += args.map(a => typeof a === "string" ? a : JSON.stringify(a, null, 1)).join(" ") + "\n";
+  }
+
+  function fail(text, err) {
+    busy(false);
+    setStatus(text, err ? String(err && err.message || err) : "", true);
+    el.open.hidden = false;
+    log("ERROR:", text, String(err && err.stack || err || ""));
+  }
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  function withTimeout(promise, ms, what) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(what + " がタイムアウトしました")), ms)),
+    ]);
+  }
+
+  function toRegex(pattern) {
+    const body = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\?/g, ".").replace(/\*/g, ".*");
+    return new RegExp("^" + body + "$", "i");
+  }
+
+  // ---- 埋め込み ----
+
+  async function connectViewer() {
+    if (mode === "url") {
+      el.frame.src = viewerUrl + "&isEmbedded=true";
+      api = await TrimbleConnectWorkspace.connect(el.frame, onEvent, 60000);
+      return;
+    }
+    el.frame.src = "https://web.connect.trimble.com/?isEmbedded=true";
+    api = await TrimbleConnectWorkspace.connect(el.frame, onEvent, 60000);
+    await api.embed.setTokens({ shareToken: stoken });
+    await api.embed.init3DViewer({ projectId: pid, modelId: mid });
+  }
+
+  const NOISY_EVENTS = /onCameraChanged|onSelectionChanged|onPicked|onPresentationChanged/;
+
+  // viewer.onModelStateChanged で対象モデルが "loaded" になったら解決する
+  let resolveModelLoaded;
+  const modelLoaded = new Promise(r => { resolveModelLoaded = r; });
+
+  function onEvent(event, data) {
+    if (event === "viewer.onModelStateChanged") {
+      const m = data && data.data;
+      if (m && m.id === mid && m.state === "loaded") resolveModelLoaded();
+    }
+    if (NOISY_EVENTS.test(event)) return;
+    log("event:", event, data && data.data !== undefined ? data.data : "");
+  }
+
+  async function waitForModel(timeoutMs) {
+    // getModels("loaded") は読み込み完了前に返ることがあるため、状態変更イベントを待つ
+    try {
+      await withTimeout(modelLoaded, timeoutMs, "モデルの読み込み");
+    } catch (e) {
+      // イベントを取り逃した場合もあるので、オブジェクト取得の再試行に任せる
+      log("loaded イベントを受信できませんでした。続行します。");
+    }
+  }
+
+  // ---- 対象の検索 ----
+
+  const PROPERTY_BATCH = 200;
+
+  /** プロパティなしでオブジェクトの一覧（ランタイム ID）だけを取得する。 */
+  async function fetchObjectIds() {
+    const t0 = Date.now();
+    const result = await withTimeout(api.viewer.getObjects(), 30000, "オブジェクト一覧の取得");
+    const group = (result || []).find(r => r.modelId === mid) || (result || [])[0];
+    const ids = group ? (group.objects || []).map(o => o.id) : [];
+    log(`getObjects: ${ids.length} 件 (${Date.now() - t0} ms)`,
+      result && result.length > 1 ? "models=" + result.map(r => r.modelId).join(",") : "");
+    return ids;
+  }
+
+  async function loadObjectsWithProperties() {
+    // 読み込み直後はオブジェクトがまだ空のことがあるので、取得できるまで待つ
+    let ids = [];
+    for (let attempt = 0; attempt < 20 && !ids.length; attempt++) {
+      try {
+        ids = await fetchObjectIds();
+      } catch (e) {
+        log("getObjects 失敗:", String(e && e.message || e));
+      }
+      if (!ids.length) await sleep(1500);
+    }
+    if (!ids.length) throw new Error("モデルのオブジェクトを取得できませんでした");
+
+    // プロパティは分割して取得する（一度に全件を要求すると応答が返らないことがある）
+    const objects = [];
+    const t0 = Date.now();
+    for (let i = 0; i < ids.length; i += PROPERTY_BATCH) {
+      const batch = ids.slice(i, i + PROPERTY_BATCH);
+      setStatus("オブジェクト情報を取得しています…", `${Math.min(i + PROPERTY_BATCH, ids.length)} / ${ids.length}`);
+      try {
+        objects.push(...await withTimeout(api.viewer.getObjectProperties(mid, batch), 30000, "プロパティの取得"));
+      } catch (e) {
+        log(`getObjectProperties 失敗 (${i}～):`, String(e && e.message || e));
+      }
+    }
+    log(`getObjectProperties: ${objects.length} 件 (${Date.now() - t0} ms)`);
+    return objects;
+  }
+
+  function flatProps(obj) {
+    const out = [];
+    for (const set of obj.properties || []) {
+      for (const p of set.properties || []) {
+        out.push({ set: set.name || "", name: p.name || "", value: p.value });
+      }
+    }
+    return out;
+  }
+
+  function findMatches(objects) {
+    const aRegex = apos.map(toRegex);
+    const pRegex = ppos.map(toRegex);
+    const aTest = apName ? n => n.toLowerCase() === apName.toLowerCase() : n => ASSEMBLY_PROPS.test(n);
+    const pTest = ppName ? n => n.toLowerCase() === ppName.toLowerCase() : n => PART_PROPS.test(n);
+
+    const allRegex = aRegex.concat(pRegex);
+    const valueOf = p => String(p.value == null ? "" : p.value).trim();
+
+    // 1. マーク用のプロパティ名で照合する
+    const ids = [];
+    const seenNames = new Set();
+    const setNames = new Set();
+    for (const obj of objects) {
+      let hit = false;
+      for (const p of flatProps(obj)) {
+        setNames.add(p.set);
+        if (/mark|pos|符号|番号/i.test(p.name)) seenNames.add(p.set + " / " + p.name);
+        const value = valueOf(p);
+        if (!value) continue;
+        if ((aRegex.length && aTest(p.name) && aRegex.some(r => r.test(value))) ||
+            (pRegex.length && pTest(p.name) && pRegex.some(r => r.test(value)))) {
+          hit = true;
+          break;
+        }
+      }
+      if (hit) ids.push(obj.id);
+    }
+
+    log("== 診断 ==");
+    log("オブジェクト数:", objects.length, " プロパティ付き:", objects.filter(o => o.properties && o.properties.length).length);
+    log("プロパティセット:", Array.from(setNames).slice(0, 40));
+    log("マークらしいプロパティ:", Array.from(seenNames).slice(0, 40));
+    log("名前で一致:", ids.length);
+
+    if (ids.length) return ids;
+
+    // 2. 見つからない場合は、どのプロパティでも値が一致するものを探す
+    const hitNames = new Map();
+    for (const obj of objects) {
+      for (const p of flatProps(obj)) {
+        const value = valueOf(p);
+        if (value && allRegex.some(r => r.test(value))) {
+          ids.push(obj.id);
+          const key = p.set + " / " + p.name;
+          hitNames.set(key, (hitNames.get(key) || 0) + 1);
+          break;
+        }
+      }
+    }
+    log("値で一致:", ids.length, Array.from(hitNames.entries()));
+    if (debugOn && objects.length) {
+      const sample = objects.find(o => o.properties && o.properties.length) || objects[0];
+      log("サンプル（先頭部分）:", JSON.stringify(sample).slice(0, 3000));
+    }
+    return ids;
+  }
+
+  // ---- 表示 ----
+
+  function selector(ids) {
+    return { modelObjectIds: [{ modelId: mid, objectRuntimeIds: ids }] };
+  }
+
+  async function showMatches() {
+    await api.viewer.setSelection(selector(matched), "set");
+    if (isolate) {
+      await api.viewer.isolateEntities([{ modelId: mid, entityIds: matched }]);
+    }
+    await api.viewer.setCamera(selector(matched));
+  }
+
+  async function showAll() {
+    try {
+      await api.viewer.setObjectState(undefined, { visible: "reset" });
+      await api.viewer.setCamera("reset");
+    } catch (e) {
+      log("showAll:", String(e));
+    }
+  }
+
+  el.focus.addEventListener("click", () => showMatches().catch(e => log("focus:", String(e))));
+  el.all.addEventListener("click", showAll);
+
+  // ---- メイン ----
+
+  async function main() {
+    if (!pid || !mid) {
+      fail("QR コードのリンクが正しくありません（pid / mid がありません）。");
+      return;
+    }
+    if (!stoken) {
+      // 公開トークンが無い場合はログインが必要なので、Trimble Connect のビューアへ移動する
+      setStatus("Trimble Connect に移動しています…");
+      location.replace(viewerUrl);
+      return;
+    }
+    if (typeof TrimbleConnectWorkspace === "undefined") {
+      fail("Trimble Connect の API を読み込めませんでした。通信状態を確認してください。");
+      return;
+    }
+
+    try {
+      setStatus("Trimble Connect に接続しています…", label ? "対象: " + label : "");
+      await withTimeout(connectViewer(), 60000, "Trimble Connect への接続");
+      log("connected, mode =", mode);
+      try { await api.ui.setUI({ name: "SidePanel", state: "collapsed" }); } catch (e) { /* 任意 */ }
+
+      setStatus("モデルを読み込んでいます…", label ? "対象: " + label : "");
+      await waitForModel(60000);
+    } catch (e) {
+      if (mode === "api") {
+        // 埋め込み方式を切り替えて再試行する
+        log("api mode failed, retry with url mode:", String(e));
+        q.set("mode", "url");
+        // フラグメントだけの変更ではページが再読み込みされないため、明示的に再読み込みする
+        history.replaceState(null, "", location.pathname + "#" + q.toString());
+        location.reload();
+        return;
+      }
+      fail("モデルを表示できませんでした。", e);
+      return;
+    }
+
+    if (!apos.length && !ppos.length) {
+      busy(false);
+      setStatus("モデルを表示しています");
+      el.open.hidden = false;
+      return;
+    }
+
+    try {
+      setStatus("対象を検索しています…", "対象: " + label);
+      const objects = await loadObjectsWithProperties();
+      matched = findMatches(objects);
+      busy(false);
+      el.open.hidden = false;
+      if (!matched.length) {
+        setStatus("対象が見つかりませんでした: " + label,
+          "モデル全体を表示しています。（モデルのプロパティにマークが含まれていない可能性があります）", true);
+        return;
+      }
+      await showMatches();
+      setStatus(label + " を表示しています", matched.length + " オブジェクト");
+      el.focus.hidden = false;
+      el.all.hidden = false;
+    } catch (e) {
+      fail("対象を表示できませんでした。", e);
+    }
+  }
+
+  main();
+})();
+</script>
+</body>
+</html>
