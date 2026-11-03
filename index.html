@@ -13,6 +13,13 @@
     --btn-bg: rgba(255, 255, 255, 0.14);
     --btn-border: rgba(255, 255, 255, 0.35);
     --page-bg: #eef1f5;
+    --panel-bg: #ffffff;
+    --panel-fg: #1f2933;
+    --panel-muted: #5f6b7a;
+    --panel-border: #d0d5db;
+    --row-hover: #eef3f8;
+    --row-active-bg: #0b3d66;
+    --row-active-fg: #ffffff;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--page-bg); }
@@ -41,7 +48,38 @@
     padding: 6px 10px; cursor: pointer;
   }
   header button[hidden], header a[hidden] { display: none; }
-  iframe { flex: 1; width: 100%; border: 0; background: var(--page-bg); }
+  #content { flex: 1; min-height: 0; display: flex; }
+  iframe { flex: 1; min-width: 0; border: 0; background: var(--page-bg); }
+  #panel {
+    flex: none; width: 260px; overflow: auto; padding: 8px;
+    background: var(--panel-bg); color: var(--panel-fg);
+    border-left: 1px solid var(--panel-border); font-size: 14px;
+  }
+  #panel[hidden] { display: none; }
+  #panel summary { display: flex; align-items: center; gap: 4px; cursor: pointer; list-style: none; }
+  #panel summary::-webkit-details-marker { display: none; }
+  #panel summary::before { content: "▶"; flex: none; width: 16px; font-size: 10px; color: var(--panel-muted); text-align: center; }
+  #panel details[open] > summary::before { content: "▼"; }
+  #panel ul { list-style: none; margin: 0 0 8px; padding: 0 0 0 20px; }
+  #panel .row {
+    width: 100%; display: flex; justify-content: space-between; gap: 8px; min-height: 32px; align-items: center;
+    padding: 4px 8px; font: inherit; color: inherit; text-align: left; overflow-wrap: anywhere;
+    background: none; border: 0; border-radius: 4px; cursor: pointer;
+  }
+  #panel .row:hover { background: var(--row-hover); }
+  #panel .row.active { background: var(--row-active-bg); color: var(--row-active-fg); }
+  #panel .assembly { font-weight: 600; }
+  #panel .bolts { margin-left: 20px; }
+  #panel .bolts > summary { min-height: 32px; font-weight: 600; }
+  #panel .option {
+    display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 8px 8px; margin-bottom: 8px;
+    border-bottom: 1px solid var(--panel-border); color: var(--panel-muted); font-size: 13px; cursor: pointer;
+  }
+  #panel .count { flex: none; font-weight: 400; font-size: 12px; opacity: 0.75; }
+  @media (max-width: 700px) {
+    #content { flex-direction: column; }
+    #panel { width: 100%; max-height: 40vh; border-left: 0; border-top: 1px solid var(--panel-border); }
+  }
   #debug {
     flex: none; max-height: 40vh; overflow: auto; margin: 0; padding: 8px 16px;
     background: #111; color: #cfe; font: 12px/1.4 Consolas, monospace; white-space: pre-wrap;
@@ -53,11 +91,17 @@
 <header>
   <div class="spinner" id="spinner"></div>
   <div id="status">準備しています…</div>
+  <button id="btnList" type="button" aria-controls="panel" hidden>部材リスト</button>
   <button id="btnFocus" type="button" hidden>対象を表示</button>
   <button id="btnAll" type="button" hidden>全体を表示</button>
   <a id="lnkOpen" target="_blank" rel="noopener" hidden>Trimble Connect で開く</a>
 </header>
-<iframe id="viewer" title="Trimble Connect 3D ビューア" allow="fullscreen; xr-spatial-tracking"></iframe>
+<div id="content">
+  <iframe id="viewer" title="Trimble Connect 3D ビューア" allow="fullscreen; xr-spatial-tracking"></iframe>
+  <aside id="panel" aria-label="製品と部材のマーク" hidden>
+    <label class="option"><input id="chkZoom" type="checkbox">クリックした部材にズーム</label>
+  </aside>
+</div>
 <pre id="debug" hidden></pre>
 
 <script src="https://cdn.jsdelivr.net/npm/trimble-connect-workspace-api@0.3.38/dist/iife/trimbleconnect.workspace.api.js"></script>
@@ -103,6 +147,9 @@
     status: document.getElementById("status"),
     spinner: document.getElementById("spinner"),
     frame: document.getElementById("viewer"),
+    list: document.getElementById("btnList"),
+    panel: document.getElementById("panel"),
+    zoom: document.getElementById("chkZoom"),
     focus: document.getElementById("btnFocus"),
     all: document.getElementById("btnAll"),
     open: document.getElementById("lnkOpen"),
@@ -114,14 +161,21 @@
 
   let api = null;
   let matched = [];
-  const markGroups = new Map();
-  let labelsAdded = false;
+  const markTree = new Map();
+  const assemblyEntities = new Map();
+  const objectsById = new Map();
 
   const MAX_LABELS = 30;
+  const NO_MARK = "マークなし";
+  const BOLT_GROUP = "ボルト";
+  // モデルに強度等級が無いため、NAME の種類から換算する（TCB: トルシア形高力ボルト、HTB: 高力六角ボルト）
+  const BOLT_GRADES = { TCB: "S10T", HTB: "F10T" };
+  const HIERARCHY_ELEMENT_ASSEMBLY = 4;
   const METERS_TO_MM = 1000;
   const LABEL_MIN_LEADER_MM = 100;
   const LABEL_MAX_LEADER_MM = 500;
-  const LABEL_COLOR = { r: 255, g: 20, b: 147, a: 255 };
+  const ASSEMBLY_LABEL_COLOR = { r: 255, g: 20, b: 147, a: 255 };
+  const PART_LABEL_COLOR = { r: 0, g: 0, b: 255, a: 255 };
   const label = [apos.join(", "), ppos.join(", ")].filter(Boolean).join(" / ");
 
   function splitPatterns(value) {
@@ -193,13 +247,21 @@
 
   // viewer.onModelStateChanged で対象モデルが "loaded" になったら解決する
   let resolveModelLoaded;
-  const modelLoaded = new Promise(r => { resolveModelLoaded = r; });
+  let rejectModelLoaded;
+  let modelLoadFailed = false;
+  const modelLoaded = new Promise((resolve, reject) => { resolveModelLoaded = resolve; rejectModelLoaded = reject; });
+  modelLoaded.catch(() => { /* waitForModel で処理する */ });
 
   function onEvent(event, data) {
     if (event === "viewer.onModelStateChanged") {
       const m = data && data.data;
       if (m && m.id === mid && m.state === "loaded") resolveModelLoaded();
+      if (m && m.id === mid && m.state === "loadingFailed") {
+        modelLoadFailed = true;
+        rejectModelLoaded(new Error("モデルの読み込みに失敗しました"));
+      }
     }
+    if (event === "viewer.onSelectionChanged") onSelectionChanged(data && data.data);
     if (NOISY_EVENTS.test(event)) return;
     log("event:", event, data && data.data !== undefined ? data.data : "");
   }
@@ -209,6 +271,7 @@
     try {
       await withTimeout(modelLoaded, timeoutMs, "モデルの読み込み");
     } catch (e) {
+      if (modelLoadFailed) throw e;
       // イベントを取り逃した場合もあるので、オブジェクト取得の再試行に任せる
       log("loaded イベントを受信できませんでした。続行します。");
     }
@@ -268,10 +331,44 @@
     return out;
   }
 
-  function addToMarkGroup(mark, id) {
-    if (!mark) return;
-    if (!markGroups.has(mark)) markGroups.set(mark, []);
-    markGroups.get(mark).push(id);
+  const classOf = obj => String(obj.class || "").toUpperCase();
+  const isAssemblyEntity = obj => classOf(obj) === "IFCELEMENTASSEMBLY";
+  const isBolt = obj => classOf(obj) === "IFCMECHANICALFASTENER";
+
+  /** 製品マーク → 部材マーク → オブジェクト ID の木に追加する。 */
+  function addToMarkTree(assemblyMark, partMark, obj) {
+    const id = obj.id;
+    const aKey = assemblyMark || NO_MARK;
+    if (!markTree.has(aKey)) markTree.set(aKey, { ids: [], parts: new Map(), bolts: new Map() });
+    const node = markTree.get(aKey);
+    node.ids.push(id);
+    // 製品そのものの実体は部材の一覧に含めない（選択すると配下の部材とボルトも強調される）
+    if (isAssemblyEntity(obj)) return;
+    const pKey = partMark || NO_MARK;
+    if (!node.parts.has(pKey)) node.parts.set(pKey, []);
+    node.parts.get(pKey).push(id);
+  }
+
+  /** オブジェクトの種類（クラス）ごとの件数と、1 件分のプロパティを診断表示する。 */
+  function logNoMarkSamples(objects, ids) {
+    if (!debugOn) return;
+    const matchedIds = new Set(ids);
+    const byClass = new Map();
+    for (const obj of objects) {
+      const key = String(obj.class || "（クラスなし）");
+      if (!byClass.has(key)) byClass.set(key, { total: 0, matched: 0, sample: obj });
+      const entry = byClass.get(key);
+      entry.total++;
+      if (matchedIds.has(obj.id)) {
+        if (!entry.matched) entry.sample = obj;
+        entry.matched++;
+      }
+    }
+    log("クラス別:", Array.from(byClass.entries()).map(([k, v]) => `${k} 全体${v.total} 対象${v.matched}`));
+    for (const [key, { sample }] of byClass) {
+      log("--- " + key + " ---");
+      log(flatProps(sample).map(p => p.name + " = " + p.value).join("\n"));
+    }
   }
 
   function findMatches(objects) {
@@ -287,20 +384,29 @@
     const ids = [];
     const seenNames = new Set();
     const setNames = new Set();
+    const marksById = new Map();
     for (const obj of objects) {
-      let assemblyMark = null;
-      let partMark = null;
+      let assemblyMark = "";
+      let partMark = "";
       for (const p of flatProps(obj)) {
         setNames.add(p.set);
         if (/mark|pos|符号|番号/i.test(p.name)) seenNames.add(p.set + " / " + p.name);
         const value = valueOf(p);
         if (!value) continue;
-        if (aRegex.length && aTest(p.name) && aRegex.some(r => r.test(value))) assemblyMark = value;
-        if (pRegex.length && pTest(p.name) && pRegex.some(r => r.test(value))) partMark = value;
+        if (aTest(p.name)) assemblyMark = value;
+        if (pTest(p.name)) partMark = value;
       }
-      if (assemblyMark || partMark) {
+      marksById.set(obj.id, { assemblyMark, partMark });
+      objectsById.set(obj.id, obj);
+      if (assemblyMark && isAssemblyEntity(obj)) {
+        if (!assemblyEntities.has(assemblyMark)) assemblyEntities.set(assemblyMark, []);
+        assemblyEntities.get(assemblyMark).push(obj.id);
+      }
+      const assemblyHit = assemblyMark && aRegex.some(r => r.test(assemblyMark));
+      const partHit = partMark && pRegex.some(r => r.test(partMark));
+      if (assemblyHit || partHit) {
         ids.push(obj.id);
-        addToMarkGroup(aRegex.length ? assemblyMark : partMark, obj.id);
+        addToMarkTree(assemblyMark, partMark, obj);
       }
     }
 
@@ -309,6 +415,7 @@
     log("プロパティセット:", Array.from(setNames).slice(0, 40));
     log("マークらしいプロパティ:", Array.from(seenNames).slice(0, 40));
     log("名前で一致:", ids.length);
+    logNoMarkSamples(objects, ids);
 
     if (ids.length) return ids;
 
@@ -319,7 +426,8 @@
         const value = valueOf(p);
         if (value && allRegex.some(r => r.test(value))) {
           ids.push(obj.id);
-          addToMarkGroup(value, obj.id);
+          const marks = marksById.get(obj.id);
+          addToMarkTree(marks.assemblyMark || value, marks.partMark, obj);
           const key = p.set + " / " + p.name;
           hitNames.set(key, (hitNames.get(key) || 0) + 1);
           break;
@@ -340,13 +448,192 @@
     return { modelObjectIds: [{ modelId: mid, objectRuntimeIds: ids }] };
   }
 
+  /** ボルトの表示名。NAME（M20x95-TCB）→ 径と長さ → 規格の順に使う。 */
+  function boltSpec(obj) {
+    const props = new Map(flatProps(obj).map(p => [p.name, p.value]));
+    const name = String(props.get("NAME") || "").trim();
+    if (name) {
+      return name
+        .replace(/(\d)x(\d)/i, "$1×$2")
+        .replace(/-(TCB|HTB)$/i, (_, type) => " " + BOLT_GRADES[type.toUpperCase()])
+        .replace(/-/g, " ");
+    }
+    const round = v => Math.round(Number(v) * 10) / 10;
+    const diameter = props.get("DIAMETER");
+    const length = props.get("LENGTH");
+    if (diameter && length) return `M${round(diameter)}×${round(length)}`;
+    const standard = String(props.get("BOLT_STANDARD") || "").trim();
+    return [standard || BOLT_GROUP, length ? `L${round(length)}` : ""].filter(Boolean).join(" ");
+  }
+
+  /** 製品の実体の子からボルトを集める（ボルトには ASSEMBLY_POS が無いため、階層から取得する）。 */
+  async function loadBolts() {
+    for (const [mark, node] of markTree) {
+      const entityIds = assemblyEntities.get(mark);
+      if (!entityIds) continue;
+      const children = await withTimeout(
+        api.viewer.getHierarchyChildren(mid, entityIds, HIERARCHY_ELEMENT_ASSEMBLY, false), 30000, "ボルト情報の取得");
+      for (const child of children || []) {
+        const obj = objectsById.get(child.id);
+        if (!obj || !isBolt(obj)) continue;
+        const spec = boltSpec(obj);
+        if (!node.bolts.has(spec)) node.bolts.set(spec, { ids: [], count: 0 });
+        const group = node.bolts.get(spec);
+        group.ids.push(obj.id);
+        const number = Number(new Map(flatProps(obj).map(p => [p.name, p.value])).get("NUMBER"));
+        group.count += number > 0 ? number : 1;
+      }
+    }
+  }
+
+  const compareMarks = (a, b) =>
+    (a === NO_MARK) - (b === NO_MARK) || a.localeCompare(b, undefined, { numeric: true });
+
+  const ZOOM_SETTING_KEY = "qr-viewer.zoomOnClick";
+  let activeRow = null;
+  let labelIds = [];
+  let selectionRequest = 0;
+
+  function setActiveRow(row) {
+    if (activeRow) activeRow.classList.remove("active");
+    activeRow = row;
+    if (row) row.classList.add("active");
+  }
+
+  /** リストで選択した対象を強調し、必要ならズームして、マークを表示する。 */
+  async function selectFromList(ids, labelSpec) {
+    const request = ++selectionRequest;
+    await api.viewer.setSelection(selector(ids), "set");
+    if (el.zoom.checked) await api.viewer.setCamera(selector(ids));
+    await clearLabels();
+    if (labelSpec && request === selectionRequest) await addLabels(labelSpec, ids, request);
+  }
+
+  /** 3D ビューの空白部分をクリックして選択が解除されたら、マークも消す。 */
+  function onSelectionChanged(selection) {
+    const count = (selection || []).reduce((sum, m) => sum + (m.objectRuntimeIds || []).length, 0);
+    log("選択:", count);
+    if (count > 0) return;
+    selectionRequest++;
+    setActiveRow(null);
+    clearLabels().catch(e => log("clearLabels:", String(e)));
+  }
+
+  async function clearLabels() {
+    const ids = labelIds;
+    labelIds = [];
+    if (ids.length) await api.markup.removeMarkups(ids);
+  }
+
+  /**
+   * マークを表示する。labelSpec.targets は表示先のオブジェクト ID（同じマークが複数あれば、それぞれに表示）。
+   * 外形を取得できない場合は、選択した対象全体の中心に 1 つ表示する。
+   */
+  async function addLabels(labelSpec, ids, request) {
+    const markups = [];
+    for (const id of labelSpec.targets.slice(0, MAX_LABELS)) {
+      const size = await measureGroup([id]);
+      if (size) markups.push(createLabel(labelSpec, size));
+    }
+    if (!markups.length) {
+      const size = await measureGroup(ids);
+      if (size) markups.push(createLabel(labelSpec, size));
+    }
+    if (!markups.length || request !== selectionRequest) return;
+    const added = await api.markup.addTextMarkup(markups);
+    const addedIds = (added || []).map(m => m.id);
+    // 追加を待っている間に別の行が選択された場合は、この結果を残さない
+    if (request === selectionRequest) labelIds = addedIds;
+    else if (addedIds.length) await api.markup.removeMarkups(addedIds);
+  }
+
+  function initZoomOption() {
+    try { el.zoom.checked = localStorage.getItem(ZOOM_SETTING_KEY) === "1"; } catch (e) { /* 保存できない環境 */ }
+    el.zoom.addEventListener("change", () => {
+      try { localStorage.setItem(ZOOM_SETTING_KEY, el.zoom.checked ? "1" : "0"); } catch (e) { /* 保存できない環境 */ }
+    });
+  }
+
+  function createRow(text, ids, className, count, labelSpec) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "row " + className;
+    const name = document.createElement("span");
+    name.textContent = text;
+    const countEl = document.createElement("span");
+    countEl.className = "count";
+    countEl.textContent = "×" + count;
+    row.append(name, countEl);
+    row.addEventListener("click", event => {
+      event.preventDefault();  // summary 内のクリックで開閉しないようにする
+      setActiveRow(row);
+      selectFromList(ids, labelSpec).catch(e => log("select:", String(e)));
+    });
+    return row;
+  }
+
+  function createBoltList(bolts) {
+    const details = document.createElement("details");
+    details.open = true;
+    details.className = "bolts";
+    const summary = document.createElement("summary");
+    summary.textContent = BOLT_GROUP;
+    const list = document.createElement("ul");
+    for (const spec of Array.from(bolts.keys()).sort(compareMarks)) {
+      const { ids, count } = bolts.get(spec);
+      const item = document.createElement("li");
+      item.append(createRow(spec, ids, "part", count,
+        { text: spec, color: PART_LABEL_COLOR, leader: true, targets: ids }));
+      list.append(item);
+    }
+    details.append(summary, list);
+    return details;
+  }
+
+  /** 右側のリスト（製品 → 部材・ボルト）を作る。 */
+  function buildMarkList() {
+    const assemblies = Array.from(markTree.keys()).sort(compareMarks);
+    for (const assemblyMark of assemblies) {
+      const node = markTree.get(assemblyMark);
+      const details = document.createElement("details");
+      details.open = assemblies.length === 1;
+      const summary = document.createElement("summary");
+      const partCount = Array.from(node.parts.values()).reduce((sum, ids) => sum + ids.length, 0);
+      const entities = assemblyEntities.get(assemblyMark) || [];
+      summary.append(createRow(assemblyMark, node.ids, "assembly", partCount,
+        { text: assemblyMark, color: ASSEMBLY_LABEL_COLOR, leader: false, targets: entities }));
+      const list = document.createElement("ul");
+      for (const partMark of Array.from(node.parts.keys()).sort(compareMarks)) {
+        const ids = node.parts.get(partMark);
+        const item = document.createElement("li");
+        item.append(createRow(partMark, ids, "part", ids.length, partMark === NO_MARK ? null
+          : { text: partMark, color: PART_LABEL_COLOR, leader: true, targets: ids }));
+        list.append(item);
+      }
+      details.append(summary, list);
+      if (node.bolts.size) details.append(createBoltList(node.bolts));
+      el.panel.append(details);
+    }
+    initZoomOption();
+    el.list.hidden = false;
+    // 幅の狭い画面（スマートフォン）ではモデルを優先し、リストは閉じておく
+    setPanelOpen(window.matchMedia("(min-width: 701px)").matches);
+  }
+
+  function setPanelOpen(open) {
+    el.panel.hidden = !open;
+    el.list.setAttribute("aria-expanded", String(open));
+  }
+
   async function showMatches() {
+    setActiveRow(null);
+    selectionRequest++;
+    await clearLabels();
     await api.viewer.setSelection(selector(matched), "set");
     if (isolate) {
       await api.viewer.isolateEntities([{ modelId: mid, entityIds: matched }]);
     }
     await api.viewer.setCamera(selector(matched));
-    await addMarkLabels();
   }
 
   /** マークごとの外形（ビューアの座標、メートル）を合成して中心と対角長を求める。 */
@@ -374,42 +661,23 @@
     };
   }
 
-  /** 製品（部材）マークを 3D ビュー上に文字で表示する。一度だけ追加する。 */
-  async function addMarkLabels() {
-    if (labelsAdded || !markGroups.size) return;
-    labelsAdded = true;
-    if (markGroups.size > MAX_LABELS) {
-      log(`マークが ${markGroups.size} 種類あるためラベルを省略します（上限 ${MAX_LABELS}）`);
-      return;
-    }
-    try {
-      const markups = [];
-      for (const [mark, ids] of markGroups) {
-        const size = await measureGroup(ids);
-        if (!size) continue;
-        const start = {
-          positionX: size.center.x * METERS_TO_MM,
-          positionY: size.center.y * METERS_TO_MM,
-          positionZ: size.center.z * METERS_TO_MM,
-        };
-        // 文字は引き出し線の終点に付くので、外形に応じた長さだけずらす
-        const leader = Math.max(LABEL_MIN_LEADER_MM,
-          Math.min(LABEL_MAX_LEADER_MM, size.diagonal * METERS_TO_MM * 0.05));
-        markups.push({
-          text: mark,
-          color: LABEL_COLOR,
-          start,
-          end: { positionX: start.positionX + leader, positionY: start.positionY - leader, positionZ: start.positionZ },
-        });
-      }
-      if (markups.length) {
-        await api.markup.addTextMarkup(markups);
-        log("ラベル:", markups.map(m => m.text));
-      }
-    } catch (e) {
-      // ラベルは補助情報なので、失敗しても表示は続ける
-      log("ラベルを追加できませんでした:", String(e && e.message || e));
-    }
+  /** labelSpec.leader が false のときは引き出し線なし（文字だけ）にする。 */
+  function createLabel(labelSpec, size) {
+    const start = {
+      positionX: size.center.x * METERS_TO_MM,
+      positionY: size.center.y * METERS_TO_MM,
+      positionZ: size.center.z * METERS_TO_MM,
+    };
+    // 文字は引き出し線の終点に付くので、外形に応じた長さだけずらす
+    const leader = labelSpec.leader
+      ? Math.max(LABEL_MIN_LEADER_MM, Math.min(LABEL_MAX_LEADER_MM, size.diagonal * METERS_TO_MM * 0.05))
+      : 0;
+    return {
+      text: labelSpec.text,
+      color: labelSpec.color,
+      start,
+      end: { positionX: start.positionX + leader, positionY: start.positionY - leader, positionZ: start.positionZ },
+    };
   }
 
   async function showAll() {
@@ -423,6 +691,7 @@
 
   el.focus.addEventListener("click", () => showMatches().catch(e => log("focus:", String(e))));
   el.all.addEventListener("click", showAll);
+  el.list.addEventListener("click", () => setPanelOpen(el.panel.hidden));
 
   // ---- メイン ----
 
@@ -482,8 +751,16 @@
           "モデル全体を表示しています。（モデルのプロパティにマークが含まれていない可能性があります）", true);
         return;
       }
+      try {
+        await loadBolts();
+      } catch (e) {
+        // ボルトは補助情報なので、取得できなくても表示は続ける
+        log("ボルト情報を取得できませんでした:", String(e && e.message || e));
+      }
+      buildMarkList();
       await showMatches();
-      setStatus(label + " を表示しています", matched.length + " オブジェクト");
+      const partCount = matched.filter(id => !isAssemblyEntity(objectsById.get(id))).length;
+      setStatus(label + " を表示しています", "部材 " + partCount + " 件");
       el.focus.hidden = false;
       el.all.hidden = false;
     } catch (e) {
