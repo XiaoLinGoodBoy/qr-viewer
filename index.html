@@ -114,6 +114,14 @@
 
   let api = null;
   let matched = [];
+  const markGroups = new Map();
+  let labelsAdded = false;
+
+  const MAX_LABELS = 30;
+  const METERS_TO_MM = 1000;
+  const LABEL_MIN_LEADER_MM = 100;
+  const LABEL_MAX_LEADER_MM = 500;
+  const LABEL_COLOR = { r: 255, g: 20, b: 147, a: 255 };
   const label = [apos.join(", "), ppos.join(", ")].filter(Boolean).join(" / ");
 
   function splitPatterns(value) {
@@ -181,7 +189,7 @@
     await api.embed.init3DViewer({ projectId: pid, modelId: mid });
   }
 
-  const NOISY_EVENTS = /onCameraChanged|onSelectionChanged|onPicked|onPresentationChanged/;
+  const NOISY_EVENTS = /onCameraChanged|onSelectionChanged|onPicked|onPresentationChanged|onMarkupChanged/;
 
   // viewer.onModelStateChanged で対象モデルが "loaded" になったら解決する
   let resolveModelLoaded;
@@ -260,6 +268,12 @@
     return out;
   }
 
+  function addToMarkGroup(mark, id) {
+    if (!mark) return;
+    if (!markGroups.has(mark)) markGroups.set(mark, []);
+    markGroups.get(mark).push(id);
+  }
+
   function findMatches(objects) {
     const aRegex = apos.map(toRegex);
     const pRegex = ppos.map(toRegex);
@@ -274,19 +288,20 @@
     const seenNames = new Set();
     const setNames = new Set();
     for (const obj of objects) {
-      let hit = false;
+      let assemblyMark = null;
+      let partMark = null;
       for (const p of flatProps(obj)) {
         setNames.add(p.set);
         if (/mark|pos|符号|番号/i.test(p.name)) seenNames.add(p.set + " / " + p.name);
         const value = valueOf(p);
         if (!value) continue;
-        if ((aRegex.length && aTest(p.name) && aRegex.some(r => r.test(value))) ||
-            (pRegex.length && pTest(p.name) && pRegex.some(r => r.test(value)))) {
-          hit = true;
-          break;
-        }
+        if (aRegex.length && aTest(p.name) && aRegex.some(r => r.test(value))) assemblyMark = value;
+        if (pRegex.length && pTest(p.name) && pRegex.some(r => r.test(value))) partMark = value;
       }
-      if (hit) ids.push(obj.id);
+      if (assemblyMark || partMark) {
+        ids.push(obj.id);
+        addToMarkGroup(aRegex.length ? assemblyMark : partMark, obj.id);
+      }
     }
 
     log("== 診断 ==");
@@ -304,6 +319,7 @@
         const value = valueOf(p);
         if (value && allRegex.some(r => r.test(value))) {
           ids.push(obj.id);
+          addToMarkGroup(value, obj.id);
           const key = p.set + " / " + p.name;
           hitNames.set(key, (hitNames.get(key) || 0) + 1);
           break;
@@ -330,6 +346,70 @@
       await api.viewer.isolateEntities([{ modelId: mid, entityIds: matched }]);
     }
     await api.viewer.setCamera(selector(matched));
+    await addMarkLabels();
+  }
+
+  /** マークごとの外形（ビューアの座標、メートル）を合成して中心と対角長を求める。 */
+  async function measureGroup(ids) {
+    const boxes = [];
+    for (let i = 0; i < ids.length; i += PROPERTY_BATCH) {
+      boxes.push(...await withTimeout(
+        api.viewer.getObjectBoundingBoxes(mid, ids.slice(i, i + PROPERTY_BATCH)), 30000, "外形の取得"));
+    }
+    const min = { x: Infinity, y: Infinity, z: Infinity };
+    const max = { x: -Infinity, y: -Infinity, z: -Infinity };
+    for (const { boundingBox: b } of boxes) {
+      if (!b || !b.min || !b.max) continue;
+      for (const axis of ["x", "y", "z"]) {
+        if (!isFinite(b.min[axis]) || !isFinite(b.max[axis])) continue;
+        min[axis] = Math.min(min[axis], b.min[axis]);
+        max[axis] = Math.max(max[axis], b.max[axis]);
+      }
+    }
+    if (!(min.x <= max.x && min.y <= max.y && min.z <= max.z)) return null;
+    log("外形:", { min, max });
+    return {
+      center: { x: (min.x + max.x) / 2, y: (min.y + max.y) / 2, z: (min.z + max.z) / 2 },
+      diagonal: Math.hypot(max.x - min.x, max.y - min.y, max.z - min.z),
+    };
+  }
+
+  /** 製品（部材）マークを 3D ビュー上に文字で表示する。一度だけ追加する。 */
+  async function addMarkLabels() {
+    if (labelsAdded || !markGroups.size) return;
+    labelsAdded = true;
+    if (markGroups.size > MAX_LABELS) {
+      log(`マークが ${markGroups.size} 種類あるためラベルを省略します（上限 ${MAX_LABELS}）`);
+      return;
+    }
+    try {
+      const markups = [];
+      for (const [mark, ids] of markGroups) {
+        const size = await measureGroup(ids);
+        if (!size) continue;
+        const start = {
+          positionX: size.center.x * METERS_TO_MM,
+          positionY: size.center.y * METERS_TO_MM,
+          positionZ: size.center.z * METERS_TO_MM,
+        };
+        // 文字は引き出し線の終点に付くので、外形に応じた長さだけずらす
+        const leader = Math.max(LABEL_MIN_LEADER_MM,
+          Math.min(LABEL_MAX_LEADER_MM, size.diagonal * METERS_TO_MM * 0.05));
+        markups.push({
+          text: mark,
+          color: LABEL_COLOR,
+          start,
+          end: { positionX: start.positionX + leader, positionY: start.positionY - leader, positionZ: start.positionZ },
+        });
+      }
+      if (markups.length) {
+        await api.markup.addTextMarkup(markups);
+        log("ラベル:", markups.map(m => m.text));
+      }
+    } catch (e) {
+      // ラベルは補助情報なので、失敗しても表示は続ける
+      log("ラベルを追加できませんでした:", String(e && e.message || e));
+    }
   }
 
   async function showAll() {
