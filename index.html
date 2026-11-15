@@ -48,6 +48,7 @@
     padding: 6px 10px; cursor: pointer;
   }
   header button[hidden], header a[hidden] { display: none; }
+  header button[aria-pressed="true"] { background: #ffffff; color: var(--bar-bg); border-color: #ffffff; }
   #content { flex: 1; min-height: 0; display: flex; }
   iframe { flex: 1; min-width: 0; border: 0; background: var(--page-bg); }
   #panel {
@@ -94,6 +95,7 @@
   <button id="btnList" type="button" aria-controls="panel" hidden>部材リスト</button>
   <button id="btnFocus" type="button" hidden>対象を表示</button>
   <button id="btnSame" type="button" hidden title="同じ製品符号の製品をすべて表示します">同一符号を表示</button>
+  <button id="btnDim" type="button" hidden aria-pressed="false" title="Trimble Connect に公開した製品図の寸法を表示します">寸法表示</button>
   <button id="btnAll" type="button" hidden>全体を表示</button>
   <a id="lnkOpen" target="_blank" rel="noopener" hidden>Trimble Connect で開く</a>
 </header>
@@ -158,6 +160,7 @@
     zoom: document.getElementById("chkZoom"),
     focus: document.getElementById("btnFocus"),
     same: document.getElementById("btnSame"),
+    dim: document.getElementById("btnDim"),
     all: document.getElementById("btnAll"),
     open: document.getElementById("lnkOpen"),
     debug: document.getElementById("debug"),
@@ -262,9 +265,21 @@
   const modelLoaded = new Promise((resolve, reject) => { resolveModelLoaded = resolve; rejectModelLoaded = reject; });
   modelLoaded.catch(() => { /* waitForModel で処理する */ });
 
+  // 共有に含めた寸法ファイル（.trb）はビューアが自動で読み込むため、モデル以外は閉じておく
+  // （寸法はボタンで必要な図面だけを表示する）。ボタンで開いたものは閉じない。
+  const allowedModels = new Set();
+  function hideExtraModel(m) {
+    if (!m || !m.id || m.id === mid || allowedModels.has(m.id) || !api) return;
+    if (m.state !== "loaded" && m.state !== "loading") return;
+    api.viewer.toggleModel(m.id, false, false)
+      .then(() => log("共有ファイルを閉じました:", m.name || m.id))
+      .catch(e => log("共有ファイルを閉じられません:", String(e && e.message || e)));
+  }
+
   function onEvent(event, data) {
     if (event === "viewer.onModelStateChanged") {
       const m = data && data.data;
+      hideExtraModel(m);
       if (m && m.id === mid && m.state === "loaded") resolveModelLoaded();
       if (m && m.id === mid && m.state === "loadingFailed") {
         modelLoadFailed = true;
@@ -594,6 +609,221 @@
     }
   }
 
+  // ---- 製品図の寸法（「Publish drawing annotations to Trimble Connect」で公開した注釈） ----
+  //
+  // 公開ツールは Trimble Connect の「…\モデル名\Annotations」に Annotations_Index.json と
+  // 図面ごとの .trb（3D 配置済みの寸法・文字）を置く。索引の各図面には、図面に描かれたオブジェクトの
+  // IFC GUID（mainObjects / modelObjectDrawingObjects）があるので、表示中の製品の GUID と照合する。
+  // 共有リンクの範囲に Annotations フォルダーが含まれていないと読めないため、その場合はボタンを出さない。
+
+  const ANNOTATION_INDEX = "annotations_index.json";
+  const tcApi = "https://" + (org || "app.connect.trimble.com") + "/tc/api/2.0";
+  let annotation = null;      // { id, name, fileId } 表示できる製品図
+  let annotationLoaded = false;
+  let annotationVisible = false;
+
+  async function tcGet(path, token) {
+    const r = await withTimeout(fetch(tcApi + path, { headers: { Authorization: "Bearer " + token } }), 20000, "Trimble Connect API");
+    if (!r.ok) throw new Error(path.replace(/[A-Za-z0-9_-]{11}/g, "{id}") + " → HTTP " + r.status);
+    return r.json();
+  }
+
+  async function folderItems(folderId, token) {
+    const items = await tcGet("/folders/" + encodeURIComponent(folderId) + "/items", token);
+    return Array.isArray(items) ? items : [];
+  }
+
+  async function downloadUrl(fileId, token) {
+    const r = await tcGet("/files/fs/" + encodeURIComponent(fileId) + "/downloadurl", token);
+    if (!r || !r.url) throw new Error("ダウンロード URL を取得できません");
+    return r.url;
+  }
+
+  /**
+   * 共有に含まれる範囲から、このモデルの Annotations フォルダー（索引ファイルを含むもの）を探す。
+   * 公開ツールの配置は「…\Tekla Models\モデル名\Annotations」。共有したフォルダーに別のモデルも入っている
+   * 場合があるので、モデル名のフォルダーを優先し、索引の modelName がこのモデルと一致するものだけを使う。
+   */
+  async function findAnnotationsFolder(share, token) {
+    const candidates = [];
+    let modelName = "";
+    const sharedFile = (share.objects || []).find(o => o.id === mid);
+    if (sharedFile && sharedFile.name) modelName = sharedFile.name;
+    // 1. モデルファイルと同じフォルダー
+    try {
+      const file = await tcGet("/files/" + encodeURIComponent(mid), token);
+      if (file && file.name) modelName = file.name;
+      if (file && file.parentId) candidates.push(file.parentId);
+    } catch (e) {
+      log("モデルのフォルダー情報を取得できません:", String(e.message || e));
+    }
+    modelName = modelName.replace(/\.[^.]+$/, "");  // 「新規モデル2025_Sub.tekla」→「新規モデル2025_Sub」
+    // 2. 共有に含まれるフォルダー
+    for (const o of share.objects || []) {
+      if (o.type === "FOLDER") candidates.push(o.id);
+    }
+    const visited = new Set();
+    const queue = candidates.map(id => ({ id, depth: 0 }));
+    while (queue.length) {
+      const { id, depth } = queue.shift();
+      if (visited.has(id)) continue;
+      visited.add(id);
+      let items;
+      try {
+        items = await folderItems(id, token);
+      } catch (e) {
+        log("フォルダーを読めません:", String(e.message || e));
+        continue;
+      }
+      const indexFile = items.find(i => i.type === "FILE" && String(i.name).toLowerCase() === ANNOTATION_INDEX);
+      if (indexFile) {
+        try {
+          const index = await (await fetch(await downloadUrl(indexFile.id, token))).json();
+          if (!modelName || !index.modelName || index.modelName === modelName) {
+            return {
+              folderId: id, index, items,
+              findTrb: async drawing => {
+                const sub = items.find(i => i.type === "FOLDER" && String(i.name).toLowerCase() === String(drawing.folder || "").toLowerCase());
+                const files = sub ? await folderItems(sub.id, token) : items;
+                return files.find(i => i.type === "FILE" && i.name === drawing.file) || null;
+              }
+            };
+          }
+          log("寸法: 別のモデルの索引のため使いません:", index.modelName);
+        } catch (e) {
+          log("寸法: 索引を読めません:", String(e.message || e));
+        }
+      }
+      if (depth >= 3) continue;
+      for (const i of items) {
+        if (i.type !== "FOLDER") continue;
+        // このモデル名のフォルダーと Annotations フォルダーを優先して探す
+        const entry = { id: i.id, depth: depth + 1 };
+        if (i.name === modelName || /^annotations$/i.test(i.name)) queue.unshift(entry); else queue.push(entry);
+      }
+    }
+    return null;
+  }
+
+  /** 共有に含まれるファイルから索引を探す（索引の modelName がこのモデルと一致するもの）。 */
+  async function findAnnotationsInShare(share, token) {
+    const files = (share.objects || []).filter(o => o.type === "FILE");
+    const modelFile = files.find(o => o.id === mid);
+    const modelName = modelFile && modelFile.name ? String(modelFile.name).replace(/\.[^.]+$/, "") : "";
+    for (const f of files.filter(o => String(o.name).toLowerCase() === ANNOTATION_INDEX)) {
+      try {
+        const index = await (await fetch(await downloadUrl(f.id, token))).json();
+        if (modelName && index.modelName && index.modelName !== modelName) {
+          log("寸法: 別のモデルの索引のため使いません:", index.modelName);
+          continue;
+        }
+        return { index, findTrb: async drawing => files.find(o => o.name === drawing.file) || null };
+      } catch (e) {
+        log("寸法: 索引を読めません:", String(e.message || e));
+      }
+    }
+    return null;
+  }
+
+  /** 表示中の製品（とその部材）の IFC GUID を集める。 */
+  async function productGuids(ids) {
+    const guids = new Set();
+    for (let i = 0; i < ids.length; i += PROPERTY_BATCH) {
+      try {
+        const batch = await withTimeout(api.viewer.convertToObjectIds(mid, ids.slice(i, i + PROPERTY_BATCH)), 20000, "GUID の取得");
+        for (const g of batch || []) if (g) guids.add(String(g));
+      } catch (e) {
+        log("convertToObjectIds 失敗:", String(e.message || e));
+      }
+    }
+    for (const g of guids) {
+      const uuid = ifcGuidToUuid(g);
+      if (uuid) guids.add(uuid.toLowerCase());
+    }
+    return guids;
+  }
+
+  /** 製品図の寸法が公開されていれば「寸法表示」ボタンを出す（見つからなければ何もしない）。 */
+  async function checkAnnotations(ids) {
+    try {
+      const shareResponse = await withTimeout(fetch(tcApi + "/shares/token/" + encodeURIComponent(stoken)), 20000, "共有情報の取得");
+      if (!shareResponse.ok) throw new Error("shares/token → HTTP " + shareResponse.status);
+      const share = await shareResponse.json();
+      const token = share.accessToken;
+      if (!token) throw new Error("共有のアクセストークンがありません");
+
+      // 共有にはフォルダーを含められない（ファイルのみ）。製品トレースの「寸法を共有に含める」は
+      // 索引と各図面の .trb をファイルとして共有に入れるので、まず共有のファイル一覧から探す。
+      const found = (await findAnnotationsInShare(share, token)) || (await findAnnotationsFolder(share, token));
+      if (!found) {
+        log("寸法: Annotations_Index.json が見つかりません（共有リンクに製品図の寸法が含まれていません）");
+        return;
+      }
+      const index = found.index;
+      const guids = await productGuids(ids);
+      const matches = (index.drawings || []).filter(d =>
+        Object.keys(d.modelObjectDrawingObjects || {}).concat(d.mainObjects || [])
+          .some(g => guids.has(String(g)) || guids.has(String(g).toLowerCase())));
+      log("寸法: 索引の図面 " + (index.drawings || []).length + " 枚、この製品の図面 " + matches.map(d => d.name).join(", "));
+      if (!matches.length) return;
+
+      // 製品図（Assembly）を優先する
+      const drawing = matches.find(d => /assembly/i.test(d.folder || "")) || matches[0];
+      const trb = await found.findTrb(drawing);
+      if (!trb) {
+        log("寸法: TRB ファイルが見つかりません:", drawing.folder + "/" + drawing.file);
+        return;
+      }
+      annotation = { id: "annotation-" + (drawing.drawingID || trb.id), name: drawing.name, fileId: trb.id, token,
+        shared: (share.objects || []).some(o => o.id === trb.id) };
+      el.dim.title = "製品図「" + drawing.name + "」の寸法を表示します";
+      el.dim.hidden = false;
+    } catch (e) {
+      log("寸法を確認できません:", String(e && e.message || e));
+    }
+  }
+
+  async function toggleAnnotation() {
+    if (!annotation) return;
+    el.dim.disabled = true;
+    try {
+      const show = !annotationVisible;
+      if (annotation.shared && annotation.mode !== "blob") {
+        // 共有に含まれるファイルは、ビューアのモデルとして開く／閉じる
+        el.dim.textContent = show ? "寸法を読み込み中…" : "寸法表示";
+        try {
+          if (show) allowedModels.add(annotation.fileId); else allowedModels.delete(annotation.fileId);
+          await api.viewer.toggleModel(annotation.fileId, show, false);
+          annotationVisible = show;
+          annotation.mode = "model";
+        } catch (e) {
+          log("toggleModel できないため、ダウンロードして表示します:", String(e && e.message || e));
+          annotation.mode = "blob";
+        }
+      }
+      if (!annotation.shared || annotation.mode === "blob") {
+        if (!annotationLoaded) {
+          el.dim.textContent = "寸法を読み込み中…";
+          const blob = await (await fetch(await downloadUrl(annotation.fileId, annotation.token))).blob();
+          await api.viewer.addTrimbimModel({ id: annotation.id, trbBlob: blob, visible: true });
+          annotationLoaded = true;
+          annotationVisible = true;
+        } else {
+          annotationVisible = show;
+          // 表示の切り替えだけなら blob を渡さない（再読み込みを避ける）
+          await api.viewer.addTrimbimModel({ id: annotation.id, visible: annotationVisible });
+        }
+      }
+    } catch (e) {
+      log("寸法を表示できません:", String(e && e.message || e));
+      setStatus("寸法を表示できませんでした", String(e && e.message || e), true);
+    } finally {
+      el.dim.disabled = false;
+      el.dim.textContent = "寸法表示";
+      el.dim.setAttribute("aria-pressed", String(annotationVisible));
+    }
+  }
+
   // ---- 表示 ----
 
   function selector(ids) {
@@ -849,6 +1079,7 @@
     .catch(e => log("focus:", String(e))));
   el.all.addEventListener("click", showAll);
   el.same.addEventListener("click", () => showSameMark());
+  el.dim.addEventListener("click", () => toggleAnnotation());
   el.list.addEventListener("click", () => setPanelOpen(el.panel.hidden));
 
   // ---- メイン ----
@@ -877,6 +1108,10 @@
 
       setStatus("モデルを読み込んでいます…", label ? "対象: " + label : "");
       await waitForModel(60000);
+      // イベントを取り逃した場合に備えて、モデル以外に開いている共有ファイルを閉じる
+      try {
+        for (const m of await api.viewer.getModels("loaded") || []) hideExtraModel({ id: m.id, name: m.name, state: "loaded" });
+      } catch (e) { /* 任意 */ }
     } catch (e) {
       if (mode === "api") {
         // 埋め込み方式を切り替えて再試行する
@@ -951,6 +1186,8 @@
       el.focus.hidden = false;
       el.all.hidden = false;
       el.same.hidden = !(foundBy === "guid" && apos.length);
+      // 製品図の寸法が公開されているかを裏で確認し、あればボタンを出す
+      checkAnnotations(matched);
     } catch (e) {
       fail("対象を表示できませんでした。", e);
     }
