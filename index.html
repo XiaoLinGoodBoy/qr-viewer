@@ -93,6 +93,7 @@
   <div id="status">準備しています…</div>
   <button id="btnList" type="button" aria-controls="panel" hidden>部材リスト</button>
   <button id="btnFocus" type="button" hidden>対象を表示</button>
+  <button id="btnSame" type="button" hidden title="同じ製品符号の製品をすべて表示します">同一符号を表示</button>
   <button id="btnAll" type="button" hidden>全体を表示</button>
   <a id="lnkOpen" target="_blank" rel="noopener" hidden>Trimble Connect で開く</a>
 </header>
@@ -114,6 +115,9 @@
  *   mid    モデル（ファイル）ID（必須）
  *   stoken 共有トークン（公開リンク）。無い場合は Trimble Connect のビューアへそのまま移動する
  *   org    共有リンクの発行元ホスト（例: app21.connect.trimble.com）
+ *   guid   製品の IFC GUID（22 文字、; 区切りで複数可）。指定されていればこれで 1 個だけを特定し、
+ *          見つからない場合は apos / ppos で検索する（製品トレースの QR コード）
+ *   sn     同一符号内の通し番号（例: 1/3）。表示用
  *   apos   製品マーク（; 区切り、? は任意の 1 文字、* は任意の文字列）
  *   ppos   部材マーク（同上）
  *   iso=1  対象以外を非表示にする
@@ -132,6 +136,8 @@
   const mid = q.get("mid") || "";
   const stoken = q.get("stoken") || "";
   const org = q.get("org") || "";
+  const guids = splitPatterns(q.get("guid"));
+  const serial = (q.get("sn") || "").trim();
   const apos = splitPatterns(q.get("apos"));
   const ppos = splitPatterns(q.get("ppos"));
   const isolate = q.get("iso") === "1";
@@ -151,6 +157,7 @@
     panel: document.getElementById("panel"),
     zoom: document.getElementById("chkZoom"),
     focus: document.getElementById("btnFocus"),
+    same: document.getElementById("btnSame"),
     all: document.getElementById("btnAll"),
     open: document.getElementById("lnkOpen"),
     debug: document.getElementById("debug"),
@@ -176,7 +183,9 @@
   const LABEL_MAX_LEADER_MM = 500;
   const ASSEMBLY_LABEL_COLOR = { r: 255, g: 20, b: 147, a: 255 };
   const PART_LABEL_COLOR = { r: 0, g: 0, b: 255, a: 255 };
-  const label = [apos.join(", "), ppos.join(", ")].filter(Boolean).join(" / ");
+  const markLabel = [apos.join(", "), ppos.join(", ")].filter(Boolean).join(" / ");
+  // 個体を指定した QR では「G1-2 (1/3)」のように通し番号も表示する
+  const label = markLabel && serial ? markLabel + " (" + serial + ")" : (markLabel || (guids.length ? "GUID " + guids.join(", ") : ""));
 
   function splitPatterns(value) {
     return (value || "").split(";").map(s => s.trim()).filter(Boolean);
@@ -202,10 +211,11 @@
 
   function busy(on) { el.spinner.hidden = !on; }
 
+  const startedAt = performance.now();
   function log(...args) {
     if (!debugOn) return;
     el.debug.hidden = false;
-    el.debug.textContent += args.map(a => typeof a === "string" ? a : JSON.stringify(a, null, 1)).join(" ") + "\n";
+    el.debug.textContent += "[" + ((performance.now() - startedAt) / 1000).toFixed(1) + "s] " + args.map(a => typeof a === "string" ? a : JSON.stringify(a, null, 1)).join(" ") + "\n";
   }
 
   function fail(text, err) {
@@ -442,6 +452,148 @@
     return ids;
   }
 
+  // ---- GUID による特定（製品トレースの QR コード） ----
+
+  const IFC_GUID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
+  // 一覧に表示する製品名（「G1-2 (1/3)」など）。キーは markTree のキー
+  const displayNames = new Map();
+
+  /** IFC の GlobalId（22 文字）を UUID 形式（8-4-4-4-12）に戻す。形式が違えば null。 */
+  function ifcGuidToUuid(g) {
+    if (!/^[0-9A-Za-z_$]{22}$/.test(g)) return null;
+    let n = 0n;
+    for (const c of g) n = n * 64n + BigInt(IFC_GUID_CHARS.indexOf(c));
+    const hex = n.toString(16).padStart(32, "0");
+    if (hex.length !== 32) return null;
+    return [hex.slice(0, 8), hex.slice(8, 12), hex.slice(12, 16), hex.slice(16, 20), hex.slice(20)].join("-");
+  }
+
+  /**
+   * GUID からビューアのランタイム ID を求める。外部 ID の形式はファイルの種類で異なるため、
+   * IFC GlobalId（22 文字）→ UUID（小文字）→ UUID（大文字）の順に試す。
+   */
+  async function resolveGuids() {
+    const found = [];
+    for (const g of guids) {
+      const uuid = ifcGuidToUuid(g);
+      const candidates = [g, uuid, uuid && uuid.toUpperCase()].filter(Boolean);
+      for (const candidate of candidates) {
+        try {
+          const ids = await withTimeout(api.viewer.convertToObjectRuntimeIds(mid, [candidate]), 20000, "GUID の変換");
+          log("convertToObjectRuntimeIds: " + candidate + " → " + JSON.stringify(ids));
+          const id = ids && ids[0];
+          if (typeof id === "number" && id >= 0) {
+            found.push(id);
+            break;
+          }
+        } catch (e) {
+          log("convertToObjectRuntimeIds 失敗:", candidate, String(e && e.message || e));
+        }
+      }
+    }
+    return Array.from(new Set(found));
+  }
+
+  /** プロパティから製品マーク・部材マークを読む。 */
+  function marksOf(obj) {
+    const aTest = apName ? n => n.toLowerCase() === apName.toLowerCase() : n => ASSEMBLY_PROPS.test(n);
+    const pTest = ppName ? n => n.toLowerCase() === ppName.toLowerCase() : n => PART_PROPS.test(n);
+    let assemblyMark = "";
+    let partMark = "";
+    for (const p of flatProps(obj)) {
+      const value = String(p.value == null ? "" : p.value).trim();
+      if (!value) continue;
+      if (aTest(p.name)) assemblyMark = value;
+      if (pTest(p.name)) partMark = value;
+    }
+    return { assemblyMark, partMark };
+  }
+
+  async function getProperties(ids) {
+    const objects = [];
+    for (let i = 0; i < ids.length; i += PROPERTY_BATCH) {
+      objects.push(...await withTimeout(
+        api.viewer.getObjectProperties(mid, ids.slice(i, i + PROPERTY_BATCH)), 30000, "プロパティの取得"));
+    }
+    return objects;
+  }
+
+  /**
+   * GUID で製品（IfcElementAssembly）を特定し、その製品の部材・ボルトだけを対象にする。
+   * モデル全体のプロパティを読まないので、マーク検索より速い。見つからなければ空配列。
+   */
+  async function findByGuid() {
+    const roots = await resolveGuids();
+    if (!roots.length) return [];
+
+    let children = [];
+    try {
+      children = await withTimeout(
+        api.viewer.getHierarchyChildren(mid, roots, HIERARCHY_ELEMENT_ASSEMBLY, true), 30000, "構成部材の取得");
+    } catch (e) {
+      log("getHierarchyChildren 失敗:", String(e && e.message || e));
+    }
+    const ids = Array.from(new Set(roots.concat((children || []).map(c => c.id))));
+    const objects = await getProperties(ids);
+    log("GUID で特定: ランタイム ID " + roots.join(",") + "・構成 " + (ids.length - roots.length) + " 件");
+
+    // 製品の実体のマークを一覧の見出しにする（無ければ QR の apos）
+    const rootObj = objects.find(o => roots.includes(o.id));
+    if (rootObj) {
+      log("特定した製品:", String(rootObj.class || ""), flatProps(rootObj)
+        .filter(p => /guid|assembly_pos|製品符号/i.test(p.name)).map(p => p.name + "=" + p.value).join(", "));
+    }
+    const rootMark = (rootObj && marksOf(rootObj).assemblyMark) || apos[0] || NO_MARK;
+    displayNames.set(rootMark, serial ? rootMark + " (" + serial + ")" : rootMark);
+    assemblyEntities.set(rootMark, roots);
+    for (const obj of objects) {
+      objectsById.set(obj.id, obj);
+      if (isBolt(obj)) continue;  // ボルトは loadBolts で規格ごとにまとめる
+      addToMarkTree(rootMark, marksOf(obj).partMark, obj);
+    }
+    return ids;
+  }
+
+  /** 同じ製品符号の製品をすべて探す（「同一符号を表示」ボタン用）。結果はキャッシュする。 */
+  let sameMarkIds = null;
+  async function findSameMark() {
+    if (sameMarkIds) return sameMarkIds;
+    const regex = apos.map(toRegex);
+    const objects = await loadObjectsWithProperties();
+    for (const obj of objects) objectsById.set(obj.id, obj);
+    sameMarkIds = objects
+      .filter(obj => { const m = marksOf(obj).assemblyMark; return m && regex.some(r => r.test(m)); })
+      .map(obj => obj.id);
+    return sameMarkIds;
+  }
+
+  async function showSameMark() {
+    busy(true);
+    setStatus("同じ製品符号の製品を検索しています…", "製品符号: " + markLabel);
+    try {
+      const ids = await findSameMark();
+      busy(false);
+      if (!ids.length) {
+        setStatus("同じ製品符号の製品が見つかりませんでした", "製品符号: " + markLabel, true);
+        return;
+      }
+      setActiveRow(null);
+      selectionRequest++;
+      await clearLabels();
+      await api.viewer.setSelection(selector(ids), "set");
+      if (isolate) await api.viewer.isolateEntities([{ modelId: mid, entityIds: ids }]);
+      await api.viewer.setCamera(selector(ids));
+      const products = ids.filter(id => {
+        const obj = objectsById.get(id);
+        return obj ? isAssemblyEntity(obj) : false;
+      }).length;
+      setStatus(markLabel + " をすべて表示しています",
+        (products ? "製品 " + products + " 個・" : "") + "「対象を表示」でスキャンした製品に戻ります");
+    } catch (e) {
+      fail("同じ製品符号の製品を表示できませんでした。", e);
+    }
+  }
+
   // ---- 表示 ----
 
   function selector(ids) {
@@ -600,8 +752,9 @@
       const summary = document.createElement("summary");
       const partCount = Array.from(node.parts.values()).reduce((sum, ids) => sum + ids.length, 0);
       const entities = assemblyEntities.get(assemblyMark) || [];
-      summary.append(createRow(assemblyMark, node.ids, "assembly", partCount,
-        { text: assemblyMark, color: ASSEMBLY_LABEL_COLOR, leader: false, targets: entities }));
+      const name = displayNames.get(assemblyMark) || assemblyMark;
+      summary.append(createRow(name, node.ids, "assembly", partCount,
+        { text: name, color: ASSEMBLY_LABEL_COLOR, leader: false, targets: entities }));
       const list = document.createElement("ul");
       for (const partMark of Array.from(node.parts.keys()).sort(compareMarks)) {
         const ids = node.parts.get(partMark);
@@ -689,8 +842,13 @@
     }
   }
 
-  el.focus.addEventListener("click", () => showMatches().catch(e => log("focus:", String(e))));
+  // 「対象を表示」でスキャンした製品に戻したら、状態表示も元に戻す
+  let resultStatus = null;
+  el.focus.addEventListener("click", () => showMatches()
+    .then(() => { if (resultStatus) setStatus(...resultStatus); })
+    .catch(e => log("focus:", String(e))));
   el.all.addEventListener("click", showAll);
+  el.same.addEventListener("click", () => showSameMark());
   el.list.addEventListener("click", () => setPanelOpen(el.panel.hidden));
 
   // ---- メイン ----
@@ -733,7 +891,7 @@
       return;
     }
 
-    if (!apos.length && !ppos.length) {
+    if (!apos.length && !ppos.length && !guids.length) {
       busy(false);
       setStatus("モデルを表示しています");
       el.open.hidden = false;
@@ -741,14 +899,26 @@
     }
 
     try {
-      setStatus("対象を検索しています…", "対象: " + label);
-      const objects = await loadObjectsWithProperties();
-      matched = findMatches(objects);
+      // 1. GUID で 1 個だけを特定する
+      let foundBy = "";
+      if (guids.length) {
+        setStatus("製品を特定しています…", "対象: " + label);
+        matched = await findByGuid();
+        if (matched.length) foundBy = "guid";
+        else log("GUID で見つかりませんでした。マークで検索します。");
+      }
+      // 2. 見つからなければ（または GUID が無い QR なら）マークで検索する
+      if (!matched.length && (apos.length || ppos.length)) {
+        setStatus("対象を検索しています…", "対象: " + markLabel);
+        const objects = await loadObjectsWithProperties();
+        matched = findMatches(objects);
+        if (matched.length) foundBy = "mark";
+      }
       busy(false);
       el.open.hidden = false;
       if (!matched.length) {
         setStatus("対象が見つかりませんでした: " + label,
-          "モデル全体を表示しています。（モデルのプロパティにマークが含まれていない可能性があります）", true);
+          "モデル全体を表示しています。（Trimble Connect のモデルにこの製品が含まれていない可能性があります）", true);
         return;
       }
       try {
@@ -759,10 +929,28 @@
       }
       buildMarkList();
       await showMatches();
-      const partCount = matched.filter(id => !isAssemblyEntity(objectsById.get(id))).length;
-      setStatus(label + " を表示しています", "部材 " + partCount + " 件");
+      const partCount = matched.filter(id => {
+        const obj = objectsById.get(id);
+        return obj && !isAssemblyEntity(obj) && !isBolt(obj);
+      }).length;
+      if (foundBy === "guid") {
+        setStatus(label + " を表示しています", "GUID で特定・部材 " + partCount + " 件");
+      } else if (guids.length) {
+        // 個体指定の QR だが GUID が見つからなかった（モデルが古い・作り直した等）
+        // assemblyEntities にはモデル内のすべての製品が入っているので、一致した符号の分だけ数える
+        const products = Array.from(markTree.keys()).reduce((sum, mark) => sum + (assemblyEntities.get(mark) || []).length, 0);
+        setStatus(markLabel + " を表示しています",
+          "この QR の製品（GUID）がモデルに無いため、同じ製品符号の製品" + (products ? " " + products + " 個" : "") +
+          "を表示しています。Trimble Connect のモデルが最新か確認してください。", true);
+      } else {
+        setStatus(label + " を表示しています", "部材 " + partCount + " 件");
+      }
+      resultStatus = [el.status.firstChild ? el.status.firstChild.textContent : "",
+        el.status.querySelector("small") ? el.status.querySelector("small").textContent : "",
+        el.status.className === "error"];
       el.focus.hidden = false;
       el.all.hidden = false;
+      el.same.hidden = !(foundBy === "guid" && apos.length);
     } catch (e) {
       fail("対象を表示できませんでした。", e);
     }
